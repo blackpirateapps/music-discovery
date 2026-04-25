@@ -1,10 +1,8 @@
 """
-music-discovery pipeline (v2.0)
+music-discovery pipeline (v2.1)
 ───────────────────────────────
-1. Fetches JSPF Recommendation Playlists from ListenBrainz.
-2. Checks Google Drive to prevent duplicate downloads.
-3. Downloads high-quality MP3s via yt-dlp.
-4. Uploads to Google Drive and cleans up local storage.
+Optimized for ListenBrainz JSPF Playlists.
+Fixed KeyError for playlist MBIDs.
 """
 
 from __future__ import annotations
@@ -61,7 +59,7 @@ def load_env(key: str, required: bool = True) -> str:
     return value
 
 # ──────────────────────────────────────────────
-# Phase 1 – ListenBrainz Client (JSPF Optimized)
+# Phase 1 – ListenBrainz Client (Fixed KeyError)
 # ──────────────────────────────────────────────
 class ListenBrainzClient:
     """Handles fetching recommendation playlists (Weekly Jams / Daily Discovery)."""
@@ -90,8 +88,20 @@ class ListenBrainzClient:
 
         # Logic: Find 'Daily Discovery' first, otherwise take the most recent one (Weekly Jams)
         target = next((p for p in playlists if "Daily" in p.get("title", "")), playlists[0])
-        playlist_mbid = target["playlist_mbid"]
-        logger.info("Targeting Playlist: '%s'", target.get('title'))
+
+        # Robust ID Extraction (Fixed the KeyError here)
+        playlist_mbid = target.get("playlist_mbid") or target.get("mbid")
+
+        # Fallback: Extract UUID from identifier URL if keys are missing
+        if not playlist_mbid and "identifier" in target:
+            # URL looks like: https://listenbrainz.org/playlist/a6c3d260-95f9-42a2-ba43-c8260521e61e
+            playlist_mbid = target["identifier"].split("/")[-1]
+
+        if not playlist_mbid:
+            logger.error("Could not find a valid MBID for playlist: %s", target.get('title'))
+            return []
+
+        logger.info("Targeting Playlist: '%s' (ID: %s)", target.get('title'), playlist_mbid)
 
         # Fetch the tracks within the chosen playlist
         track_url = f"{LB_API_BASE}/playlist/{playlist_mbid}"
@@ -186,7 +196,6 @@ class DriveUploader:
 
     def file_exists(self, filename: str) -> bool:
         """Check if file exists in the target Drive folder."""
-        # Escape single quotes for the Drive API query
         safe_name = filename.replace("'", "\\'")
         query = f"name = '{safe_name}' and '{self._folder_id}' in parents and trashed = false"
 
