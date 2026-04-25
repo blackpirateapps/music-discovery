@@ -1,8 +1,11 @@
 """
-music-discovery pipeline (v2.1)
+music-discovery pipeline (v2.2)
 ───────────────────────────────
-Optimized for ListenBrainz JSPF Playlists.
-Fixed KeyError for playlist MBIDs.
+1. Fetches JSPF Recommendation Playlists from ListenBrainz.
+2. Robustly extracts Playlist MBIDs from multiple possible JSON keys.
+3. Downloads high-quality MP3s via yt-dlp.
+4. Uploads to Google Drive with automatic OAuth2 token refresh.
+5. Idempotent: Skips files already present on Drive.
 """
 
 from __future__ import annotations
@@ -59,10 +62,10 @@ def load_env(key: str, required: bool = True) -> str:
     return value
 
 # ──────────────────────────────────────────────
-# Phase 1 – ListenBrainz Client (Fixed KeyError)
+# Phase 1 – ListenBrainz Client
 # ──────────────────────────────────────────────
 class ListenBrainzClient:
-    """Handles fetching recommendation playlists (Weekly Jams / Daily Discovery)."""
+    """Handles fetching recommendation playlists with robust ID parsing."""
 
     def __init__(self, token: str, username: str) -> None:
         self._token = token
@@ -71,14 +74,15 @@ class ListenBrainzClient:
         self._session.headers.update({"Authorization": f"Token {token}"})
 
     def fetch_recommendations(self, count: int = 25) -> list[dict]:
-        """Fetches tracks from the latest recommendation playlist."""
-        logger.info("Fetching recommendation playlists for user: %s", self._username)
+        """Official Doc Reference: GET /1/user/{username}/playlists/recommendations"""
+        logger.info("Phase 1 – Fetching playlists for user: %s", self._username)
 
         url = f"{LB_API_BASE}/user/{self._username}/playlists/recommendations"
-        resp = self._session.get(url)
-
-        if resp.status_code != 200:
-            logger.error("Could not fetch playlists. Status: %s", resp.status_code)
+        try:
+            resp = self._session.get(url, timeout=30)
+            resp.raise_for_status()
+        except requests.RequestException as e:
+            logger.error("Failed to connect to ListenBrainz: %s", e)
             return []
 
         playlists = resp.json().get("playlists", [])
@@ -86,24 +90,24 @@ class ListenBrainzClient:
             logger.warning("No recommendation playlists found.")
             return []
 
-        # Logic: Find 'Daily Discovery' first, otherwise take the most recent one (Weekly Jams)
+        # Find 'Daily Discovery' first, fallback to the latest available (Weekly Jams)
         target = next((p for p in playlists if "Daily" in p.get("title", "")), playlists[0])
 
-        # Robust ID Extraction (Fixed the KeyError here)
+        # Robust MBID Extraction to prevent KeyErrors
+        # 1. Try standard keys
+        # 2. Try the 'identifier' URL (e.g., .../playlist/<UUID>)
         playlist_mbid = target.get("playlist_mbid") or target.get("mbid")
 
-        # Fallback: Extract UUID from identifier URL if keys are missing
         if not playlist_mbid and "identifier" in target:
-            # URL looks like: https://listenbrainz.org/playlist/a6c3d260-95f9-42a2-ba43-c8260521e61e
-            playlist_mbid = target["identifier"].split("/")[-1]
+            playlist_mbid = target["identifier"].rstrip("/").split("/")[-1]
 
         if not playlist_mbid:
-            logger.error("Could not find a valid MBID for playlist: %s", target.get('title'))
+            logger.error("Could not extract a valid MBID for playlist: %s", target.get('title'))
             return []
 
         logger.info("Targeting Playlist: '%s' (ID: %s)", target.get('title'), playlist_mbid)
 
-        # Fetch the tracks within the chosen playlist
+        # Fetch actual track data from the playlist endpoint
         track_url = f"{LB_API_BASE}/playlist/{playlist_mbid}"
         track_resp = self._session.get(track_url)
 
@@ -116,7 +120,7 @@ class ListenBrainzClient:
 
         results = []
         for t in tracks_list[:count]:
-            # JSPF standard: Artist is 'creator', Track is 'title'
+            # JSPF 'track' objects use 'creator' for Artist and 'title' for Track name
             artist = t.get("creator")
             title = t.get("title")
             if artist and title:
@@ -135,11 +139,10 @@ class MusicDownloader:
 
     def download(self, artist: str, track: str) -> Optional[Path]:
         safe_name = sanitize_filename(f"{artist} - {track}")
-        # Search specifically for 'Official Audio' to avoid live/video versions
         search_query = f"ytsearch1:{artist} - {track} (Official Audio)"
         output_template = str(self._output_dir / f"{safe_name}.%(ext)s")
 
-        logger.info("Searching YouTube for: %s", safe_name)
+        logger.info("Phase 2 – Searching YouTube: %s", safe_name)
 
         ydl_opts = {
             "format": "bestaudio/best",
@@ -179,6 +182,7 @@ class DriveUploader:
         creds_info = json.loads(credentials_json)
         token_info = json.loads(token_json)
 
+        # Standard OAuth2 credential object
         creds = Credentials(
             token=token_info.get("token"),
             refresh_token=token_info.get("refresh_token"),
@@ -188,14 +192,16 @@ class DriveUploader:
             scopes=GDRIVE_SCOPES,
         )
 
+        # Automatically refresh if expired
         if creds.expired and creds.refresh_token:
-            logger.info("Refreshing Google Drive access token...")
+            logger.info("Phase 3 – Refreshing Google Drive session...")
             creds.refresh(Request())
 
         return creds
 
     def file_exists(self, filename: str) -> bool:
         """Check if file exists in the target Drive folder."""
+        # Drive API escape character for single quotes
         safe_name = filename.replace("'", "\\'")
         query = f"name = '{safe_name}' and '{self._folder_id}' in parents and trashed = false"
 
@@ -229,26 +235,26 @@ class DriveUploader:
 def main():
     logger.info("─── Starting Discovery Sync ───")
 
-    # Load Config
+    # Load Environment Secrets
     lb_token = load_env("LB_TOKEN")
     lb_user = load_env("LB_USERNAME")
     drive_creds = load_env("GDRIVE_CREDENTIALS")
     drive_token = load_env("GDRIVE_TOKEN")
     drive_folder = load_env("GDRIVE_FOLDER_ID")
 
-    # Init Clients
+    # Initialize Clients
     lb = ListenBrainzClient(lb_token, lb_user)
     uploader = DriveUploader(drive_creds, drive_token, drive_folder)
 
-    # Phase 1: Fetch
+    # 1. Fetch Playlist
     tracks = lb.fetch_recommendations(count=15)
     if not tracks:
-        logger.info("No new recommendations found. Exiting.")
+        logger.info("No recommendations found. Pipeline stopping.")
         return
 
     logger.info("Found %d tracks to process.", len(tracks))
 
-    # Phase 2 & 3: Download and Upload
+    # 2. Process Tracks in a Temporary Directory
     with tempfile.TemporaryDirectory() as tmp_dir:
         downloader = MusicDownloader(Path(tmp_dir))
 
@@ -256,21 +262,21 @@ def main():
             artist, title = t["artist_name"], t["track_name"]
             filename = sanitize_filename(f"{artist} - {title}") + ".mp3"
 
-            # Check Drive before downloading
+            # Pre-download Check
             if uploader.file_exists(filename):
                 logger.info("Skipping '%s' (Already on Drive).", filename)
                 continue
 
-            # Download
+            # Download locally
             mp3_path = downloader.download(artist, title)
             if mp3_path:
-                # Upload
+                # Upload to Drive
                 uploader.upload(mp3_path)
-                # Cleanup local file
+                # Immediate cleanup
                 if mp3_path.exists():
                     mp3_path.unlink()
 
-    logger.info("─── Pipeline Finished ───")
+    logger.info("─── Pipeline Finished Successfully ───")
 
 if __name__ == "__main__":
     main()
