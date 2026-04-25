@@ -1,0 +1,11 @@
+# Core HTTP
+requests>=2.31.0
+
+# YouTube download + audio extraction
+yt-dlp>=2024.4.9
+
+# Google Drive API
+google-api-python-client>=2.126.0
+google-auth>=2.29.0
+google-auth-httplib2>=0.2.0
+google-auth-oauthlib>=1.2.0
